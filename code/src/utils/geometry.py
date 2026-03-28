@@ -1,7 +1,11 @@
 import numpy as np
 from torch.nn import functional as F
 import torch
-from torchgeometry import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
+try:
+    from kornia.geometry.conversions import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
+except ImportError:
+    # Fallback to torchgeometry if kornia not available
+    from torchgeometry import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
 
 """
 Useful geometric operations, e.g. Perspective projection and a differentiable Rodrigues formula
