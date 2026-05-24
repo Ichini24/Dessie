@@ -3,9 +3,130 @@ from torch.nn import functional as F
 import torch
 try:
     from kornia.geometry.conversions import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
+    _USE_KORNIA = True
 except ImportError:
-    # Fallback to torchgeometry if kornia not available
-    from torchgeometry import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
+    # Fallback when kornia is not available. ``angle_axis_to_rotation_matrix``
+    # from torchgeometry is fine, but torchgeometry 0.1.2's
+    # ``rotation_matrix_to_quaternion`` inverts boolean masks with
+    # ``1 - mask``, which raises
+    #   "Subtraction, the `-` operator, with a bool tensor is not supported"
+    # on modern PyTorch. We use a dtype-safe local implementation of
+    # ``rotation_matrix_to_angle_axis`` instead (assigned below).
+    from torchgeometry import angle_axis_to_rotation_matrix
+    _USE_KORNIA = False
+
+
+def _rotation_matrix_to_quaternion(rotation_matrix, eps=1e-6):
+    """dtype-safe port of ``torchgeometry.rotation_matrix_to_quaternion``.
+
+    Identical math to torchgeometry 0.1.2, but every boolean selection mask
+    is cast to the matrix dtype before any arithmetic, so the ``1 - mask``
+    inversions never touch a bool tensor (which modern PyTorch rejects).
+
+    Shape: input ``(N, 3, 4)`` -> output ``(N, 4)``.
+    """
+    if not torch.is_tensor(rotation_matrix):
+        raise TypeError("Input type is not a torch.Tensor. Got {}".format(
+            type(rotation_matrix)))
+    if len(rotation_matrix.shape) > 3:
+        raise ValueError(
+            "Input size must be a three dimensional tensor. Got {}".format(
+                rotation_matrix.shape))
+    if not rotation_matrix.shape[-2:] == (3, 4):
+        raise ValueError(
+            "Input size must be a N x 3 x 4  tensor. Got {}".format(
+                rotation_matrix.shape))
+
+    rmat_t = torch.transpose(rotation_matrix, 1, 2)
+
+    # Cast masks to the matrix dtype up front so all subsequent
+    # arithmetic (including ``1 - mask``) stays in floating point.
+    mask_d2 = (rmat_t[:, 2, 2] < eps).type_as(rotation_matrix)
+    mask_d0_d1 = (rmat_t[:, 0, 0] > rmat_t[:, 1, 1]).type_as(rotation_matrix)
+    mask_d0_nd1 = (rmat_t[:, 0, 0] < -rmat_t[:, 1, 1]).type_as(rotation_matrix)
+
+    t0 = 1 + rmat_t[:, 0, 0] - rmat_t[:, 1, 1] - rmat_t[:, 2, 2]
+    q0 = torch.stack([rmat_t[:, 1, 2] - rmat_t[:, 2, 1],
+                      t0, rmat_t[:, 0, 1] + rmat_t[:, 1, 0],
+                      rmat_t[:, 2, 0] + rmat_t[:, 0, 2]], -1)
+    t0_rep = t0.repeat(4, 1).t()
+
+    t1 = 1 - rmat_t[:, 0, 0] + rmat_t[:, 1, 1] - rmat_t[:, 2, 2]
+    q1 = torch.stack([rmat_t[:, 2, 0] - rmat_t[:, 0, 2],
+                      rmat_t[:, 0, 1] + rmat_t[:, 1, 0],
+                      t1, rmat_t[:, 1, 2] + rmat_t[:, 2, 1]], -1)
+    t1_rep = t1.repeat(4, 1).t()
+
+    t2 = 1 - rmat_t[:, 0, 0] - rmat_t[:, 1, 1] + rmat_t[:, 2, 2]
+    q2 = torch.stack([rmat_t[:, 0, 1] - rmat_t[:, 1, 0],
+                      rmat_t[:, 2, 0] + rmat_t[:, 0, 2],
+                      rmat_t[:, 1, 2] + rmat_t[:, 2, 1], t2], -1)
+    t2_rep = t2.repeat(4, 1).t()
+
+    t3 = 1 + rmat_t[:, 0, 0] + rmat_t[:, 1, 1] + rmat_t[:, 2, 2]
+    q3 = torch.stack([t3, rmat_t[:, 1, 2] - rmat_t[:, 2, 1],
+                      rmat_t[:, 2, 0] - rmat_t[:, 0, 2],
+                      rmat_t[:, 0, 1] - rmat_t[:, 1, 0]], -1)
+    t3_rep = t3.repeat(4, 1).t()
+
+    mask_c0 = mask_d2 * mask_d0_d1
+    mask_c1 = mask_d2 * (1 - mask_d0_d1)
+    mask_c2 = (1 - mask_d2) * mask_d0_nd1
+    mask_c3 = (1 - mask_d2) * (1 - mask_d0_nd1)
+    mask_c0 = mask_c0.view(-1, 1).type_as(q0)
+    mask_c1 = mask_c1.view(-1, 1).type_as(q1)
+    mask_c2 = mask_c2.view(-1, 1).type_as(q2)
+    mask_c3 = mask_c3.view(-1, 1).type_as(q3)
+
+    q = q0 * mask_c0 + q1 * mask_c1 + q2 * mask_c2 + q3 * mask_c3
+    q /= torch.sqrt(t0_rep * mask_c0 + t1_rep * mask_c1 +  # noqa
+                    t2_rep * mask_c2 + t3_rep * mask_c3)  # noqa
+    q *= 0.5
+    return q
+
+
+def _quaternion_to_angle_axis(quaternion):
+    """Port of ``torchgeometry.quaternion_to_angle_axis`` (no bool ops).
+
+    Shape: input ``(*, 4)`` -> output ``(*, 3)``.
+    """
+    if not torch.is_tensor(quaternion):
+        raise TypeError("Input type is not a torch.Tensor. Got {}".format(
+            type(quaternion)))
+    if not quaternion.shape[-1] == 4:
+        raise ValueError("Input must be a tensor of shape Nx4 or 4. Got {}"
+                         .format(quaternion.shape))
+    q1 = quaternion[..., 1]
+    q2 = quaternion[..., 2]
+    q3 = quaternion[..., 3]
+    sin_squared_theta = q1 * q1 + q2 * q2 + q3 * q3
+
+    sin_theta = torch.sqrt(sin_squared_theta)
+    cos_theta = quaternion[..., 0]
+    two_theta = 2.0 * torch.where(
+        cos_theta < 0.0,
+        torch.atan2(-sin_theta, -cos_theta),
+        torch.atan2(sin_theta, cos_theta))
+
+    k_pos = two_theta / sin_theta
+    k_neg = 2.0 * torch.ones_like(sin_theta)
+    k = torch.where(sin_squared_theta > 0.0, k_pos, k_neg)
+
+    angle_axis = torch.zeros_like(quaternion)[..., :3]
+    angle_axis[..., 0] += q1 * k
+    angle_axis[..., 1] += q2 * k
+    angle_axis[..., 2] += q3 * k
+    return angle_axis
+
+
+def _rotation_matrix_to_angle_axis(rotation_matrix):
+    """dtype-safe replacement for ``torchgeometry.rotation_matrix_to_angle_axis``."""
+    quaternion = _rotation_matrix_to_quaternion(rotation_matrix)
+    return _quaternion_to_angle_axis(quaternion)
+
+
+if not _USE_KORNIA:
+    rotation_matrix_to_angle_axis = _rotation_matrix_to_angle_axis
 
 """
 Useful geometric operations, e.g. Perspective projection and a differentiable Rodrigues formula
